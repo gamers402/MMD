@@ -1,0 +1,257 @@
+import asyncio
+import colorsys
+import ctypes
+import io
+import queue
+import threading
+import tkinter as tk
+
+from PIL import Image
+
+# ---------------- settings ----------------
+STRENGTH = 0.005              # overlay opacity. 0.08 = subtle, 0.12 = noticeable, 0.20 = strong
+NORMALIZE_LIGHTNESS = True   # lift dark colors / tame pale ones so the tint reads as a hue, not dimming
+POLL_SECONDS = 1.0           # how often the worker checks what is playing
+FETCH_TIMEOUT = 5.0          # give up on a media read that takes longer than this
+FADE_MS = 1000                # how long a color transition takes
+FADE_STEPS = 20
+SPOTIFY_ONLY = True          # False = follow whatever media player Windows considers current
+
+user32 = ctypes.windll.user32
+
+# Tell ctypes the exact argument types of every Win32 function we call. Without this,
+# ctypes passes plain Python ints as 32-bit values, which corrupts 64-bit handle
+# arguments such as HWND_TOPMOST (-1) and makes SetWindowPos silently fail.
+from ctypes import wintypes
+user32.GetParent.argtypes = [wintypes.HWND]
+user32.GetParent.restype = wintypes.HWND
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+user32.SetWindowLongW.restype = ctypes.c_long
+user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD]
+user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetWindowPos.restype = wintypes.BOOL
+updates = queue.Queue()      # worker -> overlay: an (r, g, b) tuple, or None for "no tint"
+stop_event = threading.Event()
+
+
+# ---------------- color analysis ----------------
+def prominent_color(image_bytes):
+    """Median-cut the cover into 16 color groups and return the biggest group
+    that is not near-black, near-white, or gray. Returns None if every group fails."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img.thumbnail((100, 100))
+    q = img.quantize(colors=16, method=Image.Quantize.MEDIANCUT)
+    palette = q.getpalette()
+
+    for count, idx in sorted(q.getcolors(), reverse=True):   # biggest group first
+        r, g, b = palette[idx * 3: idx * 3 + 3]
+        h, l, s = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+        if l < 0.12 or l > 0.90 or s < 0.20:
+            continue
+        if NORMALIZE_LIGHTNESS:
+            r, g, b = (round(c * 255) for c in colorsys.hls_to_rgb(h, 0.5, s))
+        return (r, g, b)
+    return None
+
+
+# ---------------- background worker: media session ----------------
+def media_worker():
+    # Imported here so all Windows Runtime setup happens on this thread, not Tkinter's.
+    try:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+        )
+        from winrt.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+    except ImportError:
+        try:
+            from winsdk.windows.media.control import (
+                GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+                GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+            )
+            from winsdk.windows.storage.streams import Buffer, DataReader, InputStreamOptions
+        except ImportError as e:
+            print("Could not import the Windows media packages:", e)
+            return
+
+    async def fetch_now_playing():
+        """Return (cover_bytes or None, is_playing), or None if no suitable session exists."""
+        manager = await MediaManager.request_async()
+
+        session = None
+        for s in manager.get_sessions():
+            if "spotify" in s.source_app_user_model_id.lower():
+                session = s
+                break
+        if session is None and not SPOTIFY_ONLY:
+            session = manager.get_current_session()
+        if session is None:
+            return None
+
+        is_playing = session.get_playback_info().playback_status == PlaybackStatus.PLAYING
+        props = await session.try_get_media_properties_async()
+
+        cover = None
+        if props.thumbnail is not None:
+            stream = await props.thumbnail.open_read_async()
+            buf = Buffer(stream.size)
+            await stream.read_async(buf, buf.capacity, InputStreamOptions.READ_AHEAD)
+            data = bytearray(buf.length)
+            DataReader.from_buffer(buf).read_bytes(data)
+            cover = bytes(data)
+
+        return cover, is_playing
+
+    async def loop():
+        last_cover = None
+        color = None
+        while not stop_event.is_set():
+            try:
+                result = await asyncio.wait_for(fetch_now_playing(), timeout=FETCH_TIMEOUT)
+            except asyncio.TimeoutError:
+                print(f"Media read took longer than {FETCH_TIMEOUT}s, skipping this check")
+                result = None
+            except Exception as e:
+                print("Could not read media session:", repr(e))
+                result = None
+
+            if result is None or not result[1]:          # nothing found, or paused
+                updates.put(None)
+            else:
+                cover = result[0]
+                if cover and cover != last_cover:        # only re-analyze when the art changes
+                    last_cover = cover
+                    try:
+                        color = prominent_color(cover)
+                        print("New cover, tint color:", color)
+                    except Exception as e:
+                        print("Could not analyze cover:", repr(e))
+                        color = None
+                elif not cover:
+                    print("Spotify is playing but gave Windows no cover image")
+                updates.put(color)
+
+            await asyncio.sleep(POLL_SECONDS)
+
+    asyncio.run(loop())
+
+
+# ---------------- main thread: the overlay window ----------------
+class Overlay:
+    def __init__(self):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
+
+        self.root = tk.Tk()
+        self.root.overrideredirect(True)
+
+        x, y = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+        w, h = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+        self.root.configure(bg="#000000")
+        self.root.update()                       # make sure the real window exists before touching it
+        self.hwnd = user32.GetParent(self.root.winfo_id())   # Tk's outer window handle
+
+        # From here on, never use root.attributes(...): Tk rewrites the window's extended
+        # style from its own saved copy whenever you do, which wipes out click-through.
+        self._make_click_through()
+        self._set_alpha(0.0)
+        self._keep_on_top()
+
+        self.color = (0, 0, 0)
+        self.alpha = 0.0
+        self.fade_target = None
+        self.fade_job = None
+
+    def _make_click_through(self):
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x80000
+        WS_EX_TRANSPARENT = 0x20
+        WS_EX_TOOLWINDOW = 0x80
+        WS_EX_NOACTIVATE = 0x08000000
+        # (topmost is not set here: Windows only honors it through SetWindowPos, see _keep_on_top)
+        wanted = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        style = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        if style & wanted != wanted:             # only write if something is missing
+            user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, style | wanted)
+
+    def _set_alpha(self, alpha):
+        LWA_ALPHA = 0x2
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, int(alpha * 255), LWA_ALPHA)
+
+    def _keep_on_top(self):
+        HWND_TOPMOST = -1
+        SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+        if not user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                   SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE):
+            print("SetWindowPos failed, Windows error code:", ctypes.GetLastError())
+
+    def fade_to(self, color, alpha):
+        if (color, alpha) == self.fade_target:
+            return
+        self.fade_target = (color, alpha)
+        if self.fade_job:
+            self.root.after_cancel(self.fade_job)
+
+        start_c = color if self.alpha == 0 else self.color
+        start_a = self.alpha
+
+        def step(i):
+            t = i / FADE_STEPS
+            t = t * t * (3 - 2 * t)
+            self.color = tuple(round(a + (b - a) * t) for a, b in zip(start_c, color))
+            self.alpha = start_a + (alpha - start_a) * t
+            self.root.configure(bg="#%02x%02x%02x" % self.color)
+            self._set_alpha(self.alpha)
+            if i < FADE_STEPS:
+                self.fade_job = self.root.after(FADE_MS // FADE_STEPS, step, i + 1)
+            else:
+                self.fade_job = None
+
+        step(1)
+
+    def check_updates(self):
+        """Runs every 100 ms. Takes the newest message from the worker, never waits."""
+        latest, got_one = None, False
+        try:
+            while True:
+                latest = updates.get_nowait()
+                got_one = True
+        except queue.Empty:
+            pass
+
+        if got_one:
+            if latest:
+                self.fade_to(latest, STRENGTH)
+            else:
+                self.fade_to(self.color, 0.0)
+            self._make_click_through()           # re-check the style, in case anything reset it
+            self._keep_on_top()
+
+        self.root.after(100, self.check_updates)
+
+    def check_quit_hotkey(self):
+        down = lambda vk: user32.GetAsyncKeyState(vk) & 0x8000
+        if down(0x11) and down(0x10) and down(0x51):  # Ctrl + Shift + Q
+            stop_event.set()
+            self.root.destroy()
+            return
+        self.root.after(50, self.check_quit_hotkey)
+
+    def run(self):
+        threading.Thread(target=media_worker, daemon=True).start()
+        self.root.after(100, self.check_updates)
+        self.root.after(50, self.check_quit_hotkey)
+        print("Running. Press Ctrl+Shift+Q to quit.")
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    Overlay().run()
